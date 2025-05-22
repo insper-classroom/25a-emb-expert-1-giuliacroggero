@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+//
+// Created by elliot on 25/05/24.
+//
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "pico/unique_id.h"
@@ -11,13 +14,17 @@
 #include "hardware/irq.h"
 #include "hardware/adc.h"
 #include "lwip/apps/mqtt.h"
-#include "lwip/apps/mqtt_priv.h"
+#include "lwip/apps/mqtt_priv.h" // needed to set hostname
 #include "lwip/dns.h"
 #include "lwip/altcp_tls.h"
 
-#define WIFI_SSID "greta"
-#define WIFI_PASSWORD "greta1109"
+#define WIFI_SSID "Arnaldojr"
+#define WIFI_PASSWORD "12345678"
 #define MQTT_SERVER "broker.hivemq.com"
+#define led 20
+#define ldr 28
+
+
 // Temperature
 #ifndef TEMPERATURE_UNITS
 #define TEMPERATURE_UNITS 'C' // Set to 'F' for Fahrenheit
@@ -64,8 +71,8 @@ typedef struct {
 #define ERROR_printf printf
 #endif
 
-// how often to measure our light sensor
-#define LIGHT_WORKER_TIME_S 10
+// how often to measure our temperature
+#define TEMP_WORKER_TIME_S 10
 
 // keep alive in seconds
 #define MQTT_KEEP_ALIVE_S 60
@@ -95,11 +102,21 @@ typedef struct {
 /* References for this implementation:
  * raspberry-pi-pico-c-sdk.pdf, Section '4.1.1. hardware_adc'
  * pico-examples/adc/adc_console/adc_console.c */
-static float read_ambient_light(void) {
+static float read_onboard_temperature(const char unit) {
+
     /* 12-bit conversion, assume max value == ADC_VREF == 3.3 V */
-    const float conversionFactor = 100.0f / (1 << 12); // Convert to percentage
+    const float conversionFactor = 3.3f / (1 << 12);
+
     float adc = (float)adc_read() * conversionFactor;
-    return adc; // Higher ADC value = brighter light (0-100%)
+    float tempC = 27.0f - (adc - 0.706f) / 0.001721f;
+
+    if (unit == 'C' || unit != 'F') {
+        return tempC;
+    } else if (unit == 'F') {
+        return tempC * 9 / 5 + 32;
+    }
+
+    return -1.0f;
 }
 
 static void pub_request_cb(__unused void *arg, err_t err) {
@@ -119,27 +136,37 @@ static const char *full_topic(MQTT_CLIENT_DATA_T *state, const char *name) {
 }
 
 static void control_led(MQTT_CLIENT_DATA_T *state, bool on) {
-    // Publish state on /state topic and on/off led on GPIO 13
+    // Publish state on /state topic and on/off led board
     const char* message = on ? "On" : "Off";
     if (on)
-        gpio_put(20, 1);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     else
-        gpio_put(20, 0);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
 
     mqtt_publish(state->mqtt_client_inst, full_topic(state, "/led/state"), message, strlen(message), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
 }
 
-static void publish_light(MQTT_CLIENT_DATA_T *state) {
-    static float old_light = -1.0f; // Initialize to an invalid value to ensure first reading is published
-    const char *light_key = full_topic(state, "/light_sensor");
-    float light = read_ambient_light();
-    if (light != old_light) {
-        old_light = light;
-        // Publish light level on /light_sensor topic
-        char light_str[16];
-        snprintf(light_str, sizeof(light_str), "%.2f", light);
-        INFO_printf("Publishing %s to %s\n", light_str, light_key);
-        mqtt_publish(state->mqtt_client_inst, light_key, light_str, strlen(light_str), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+static void onoff(MQTT_CLIENT_DATA_T *state, bool on) {
+    const char* message = on ? "On" : "Off";
+    if (on)
+        gpio_put(led, 1);
+    else
+        gpio_put(led, 0);
+
+    mqtt_publish(state->mqtt_client_inst, full_topic(state, "/led/state"), message, strlen(message), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
+}
+
+static void publish_temperature(MQTT_CLIENT_DATA_T *state) {
+    static float old_temperature;
+    const char *temperature_key = full_topic(state, "/temperature");
+    float temperature = read_onboard_temperature(TEMPERATURE_UNITS);
+    if (temperature != old_temperature) {
+        old_temperature = temperature;
+        // Publish temperature on /temperature topic
+        char temp_str[16];
+        snprintf(temp_str, sizeof(temp_str), "%.2f", temperature);
+        INFO_printf("Publishing %s to %s\n", temp_str, temperature_key);
+        mqtt_publish(state->mqtt_client_inst, temperature_key, temp_str, strlen(temp_str), MQTT_PUBLISH_QOS, MQTT_PUBLISH_RETAIN, pub_request_cb, state);
     }
 }
 
@@ -167,7 +194,8 @@ static void unsub_request_cb(void *arg, err_t err) {
 
 static void sub_unsub_topics(MQTT_CLIENT_DATA_T* state, bool sub) {
     mqtt_request_cb_t cb = sub ? sub_request_cb : unsub_request_cb;
-    mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/led"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
+    mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/giulialed"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
+    mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/giulialed2"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/print"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/ping"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
     mqtt_sub_unsub(state->mqtt_client_inst, full_topic(state, "/exit"), MQTT_SUBSCRIBE_QOS, cb, state, sub);
@@ -185,7 +213,7 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
     state->data[len] = '\0';
 
     DEBUG_printf("Topic: %s, Message: %s\n", state->topic, state->data);
-    if (strcmp(basic_topic, "/led") == 0)
+    if (strcmp(basic_topic, "/giulialed") == 0)
     {
         if (lwip_stricmp((const char *)state->data, "On") == 0 || strcmp((const char *)state->data, "1") == 0)
             control_led(state, true);
@@ -200,7 +228,13 @@ static void mqtt_incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t f
     } else if (strcmp(basic_topic, "/exit") == 0) {
         state->stop_client = true; // stop the client when ALL subscriptions are stopped
         sub_unsub_topics(state, false); // unsubscribe
+    } else if (strcmp(basic_topic, "/giulialed2") == 0){
+        if (lwip_stricmp((const char *)state->data, "On") == 0 || strcmp((const char *)state->data, "1") == 0)
+            onoff(state, true);
+        else if (lwip_stricmp((const char *)state->data, "Off") == 0 || strcmp((const char *)state->data, "0") == 0)
+            onoff(state, false);
     }
+    
 }
 
 static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len) {
@@ -208,12 +242,12 @@ static void mqtt_incoming_publish_cb(void *arg, const char *topic, u32_t tot_len
     strncpy(state->topic, topic, sizeof(state->topic));
 }
 
-static void light_worker_fn(async_context_t *context, async_at_time_worker_t *worker) {
+static void temperature_worker_fn(async_context_t *context, async_at_time_worker_t *worker) {
     MQTT_CLIENT_DATA_T* state = (MQTT_CLIENT_DATA_T*)worker->user_data;
-    publish_light(state);
-    async_context_add_at_time_worker_in_ms(context, worker, LIGHT_WORKER_TIME_S * 1000);
+    publish_temperature(state);
+    async_context_add_at_time_worker_in_ms(context, worker, TEMP_WORKER_TIME_S * 1000);
 }
-static async_at_time_worker_t light_worker = { .do_work = light_worker_fn };
+static async_at_time_worker_t temperature_worker = { .do_work = temperature_worker_fn };
 
 static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection_status_t status) {
     MQTT_CLIENT_DATA_T* state = (MQTT_CLIENT_DATA_T*)arg;
@@ -226,14 +260,15 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
             mqtt_publish(state->mqtt_client_inst, state->mqtt_client_info.will_topic, "1", 1, MQTT_WILL_QOS, true, pub_request_cb, state);
         }
 
-        // Publish light level every 10 sec if it's changed
-        light_worker.user_data = state;
-        async_context_add_at_time_worker_in_ms(cyw43_arch_async_context(), &light_worker, 0);
+        // Publish temperature every 10 sec if it's changed
+        temperature_worker.user_data = state;
+        async_context_add_at_time_worker_in_ms(cyw43_arch_async_context(), &temperature_worker, 0);
     } else if (status == MQTT_CONNECT_DISCONNECTED) {
         if (!state->connect_done) {
             panic("Failed to connect to mqtt server");
         }
-    } else {
+    }
+    else {
         panic("Unexpected status");
     }
 }
@@ -281,19 +316,17 @@ int main(void) {
     stdio_init_all();
     INFO_printf("mqtt client starting\n");
 
-    // Initialize light sensor on GPIO 28 (ADC2)
-    adc_init();
-    adc_gpio_init(28);
-    adc_select_input(2);
+    gpio_init(led);
+    gpio_set_dir(led, GPIO_OUT);
 
-    // Initialize LED on GPIO 13
-    gpio_init(20);
-    gpio_set_dir(20, GPIO_OUT);
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+    adc_select_input(4);
 
     static MQTT_CLIENT_DATA_T state;
 
     if (cyw43_arch_init()) {
-        panic("Failed to initialize CYW43");
+        panic("Failed to inizialize CYW43");
     }
 
     // Use board unique id
@@ -338,7 +371,7 @@ int main(void) {
     WARN_printf("Warning: tls without verification is insecure\n");
 #endif
 #else
-    state.mqtt_client_info.tls_config = altcp_tls_create_config_client(NULL, 0);
+    state->client_info.tls_config = altcp_tls_create_config_client(NULL, 0);
     WARN_printf("Warning: tls without a certificate is insecure\n");
 #endif
 #endif
